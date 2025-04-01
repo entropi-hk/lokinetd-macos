@@ -1,0 +1,180 @@
+#!/usr/bin/env bash
+
+# lokinetd-macos
+# =================
+# Provides the following functions:
+#   lokinet up [LOKINET_PATH]     - Start Lokinet daemon and reconfigure the hardcoded DNS configuration.
+#                                   Optionally provide path to Lokinet executable
+#   lokinet down [LOKINET_PATH]   - Stop the Lokinet daemon.
+#                                   Optionally provide path to Lokinet executable
+#   lokinet update                - Update the utilities to latest version from main branch. (todo: versioning)
+#   lokinet version               - Display script version (you should use script at parity with installed Lokinet
+#                                   version as it's subject to change)
+#
+# This script is currently only compatible with Bash and Zsh.
+#
+# To use these functions, ensure that the installation directory is in your env PATH.
+# If you used installation script, this should already be added to correct shell config file.
+
+set -e
+
+# Script version
+VERSION="0.9.11"
+
+# Lokinet's default binary location
+DEFAULT_LOKINET_PATH="/Applications/Lokinet.app/Contents/MacOS/Lokinet"
+LOKINET_PATH=""
+
+# Set Lokinet binary path - provided or fallback to default
+set_lokinet_path() {
+  LOKINET_PATH="${1:-$DEFAULT_LOKINET_PATH}"
+}
+
+# Regex helper to extract values from Lokinet's stdout
+extract_match() {
+  if command -v grep > /dev/null; then
+    echo "$1" | grep -oE "$2" | awk '{print $NF}'
+  fi
+}
+
+# Stop Lokinet deamon
+stop_lokinet() {
+  set_lokinet_path "$1"
+  echo "Stopping Lokinet daemon..."
+  "$LOKINET_PATH" --stop > /dev/null 2>&1
+  echo "Lokinet stopped"
+}
+
+# Attain sudo before performing operations
+check_sudo() {
+  if ! sudo -n true 2> /dev/null; then
+    echo "This utility uses \`scutil\` which requires sudo."
+    sudo true || return 1
+  fi
+}
+
+up() {
+  set_lokinet_path "$1"
+
+  # Expected Lokinet Network Service domain name
+  local LOKINET_SERVICE_DOMAIN='localhost.loki'
+
+  if [[ ! -f "$LOKINET_PATH" ]]; then
+    echo "Error: Lokinet binary not found at '$LOKINET_PATH'" >&2
+    return 1
+  fi
+
+  # Start Lokinet daemon
+  local STARTUP_OUTPUT=""
+  STARTUP_OUTPUT=$("$LOKINET_PATH" --start 2>&1)
+
+  if [[ "$STARTUP_OUTPUT" =~ 'VPN already connected' ]]; then
+    echo "Lokinet already running. Please run \`lokinet down\` to stop Lokinet"
+    return 1
+  fi
+
+  if [[ "$STARTUP_OUTPUT" =~ 'VPN is disconnected' ]]; then
+    echo "Lokinet is disconnecting.. try again in a few seconds"
+    return 1
+  fi
+
+  check_sudo || return 1
+
+  # Grab global DNS config using scutil, which should now be set to use Lokinet's resolver
+  local GLOBAL_DNS
+  GLOBAL_DNS=$(scutil <<< 'show State:/Network/Global/DNS') || {
+    echo "Error: Failed to fetch Global DNS Config" >&2
+    return 1
+  }
+
+  # Extract the Network Service ID from the config
+  local DEVICE_ID
+  DEVICE_ID=$(extract_match "$GLOBAL_DNS" 'Supplemental:[[:space:]]*([^[:space:]]+)')
+  if [[ -n "$DEVICE_ID" ]]; then
+    echo "Network Extension ID: $DEVICE_ID"
+  else
+    echo "Error: Could not find expected Network Service ID" >&2
+    stop_lokinet
+    return 1
+  fi
+
+  # Match DomainName from DNS resolver config
+  local DNS_RESOLVER_CONFIG
+  DNS_RESOLVER_CONFIG=$(scutil <<< "show State:/Network/Service/$DEVICE_ID/DNS" 2> /dev/null) || {
+    echo "Error: Failed to fetch DNS resolver config for Network Service '$DEVICE_ID'" >&2
+    stop_lokinet
+    return 1
+  }
+
+  # Match DomainName from DNS resolver config
+  local RESOLVER_DOMAIN
+  RESOLVER_DOMAIN=$(extract_match "$DNS_RESOLVER_CONFIG" 'DomainName[[:space:]]*:[[:space:]]*([^[:space:]]+)')
+  if [[ -n "$RESOLVER_DOMAIN" ]]; then
+    echo "Found Lokinet Domain: $RESOLVER_DOMAIN"
+  else
+    echo "Error: Could not find DomainName in DNS resolver config" >&2
+    stop_lokinet
+    return 1
+  fi
+
+  # Validate DomainName matches expected Lokinet domain
+  if [[ "$RESOLVER_DOMAIN" != "$LOKINET_SERVICE_DOMAIN" ]]; then
+    echo "Error: The extracted domain '$RESOLVER_DOMAIN' does not match expected domain '$LOKINET_SERVICE_DOMAIN'" >&2
+    stop_lokinet
+    return 1
+  fi
+
+  # Remove Lokinet's full DNS takeover using scutil (scutil's 'set' requires sudo)
+  sudo scutil << EOF
+get State:/Network/Service/$DEVICE_ID/DNS
+d.remove SearchDomains
+d.remove SupplementalMatchDomains
+d.remove SupplementalMatchDomainsNoSearch
+set State:/Network/Service/$DEVICE_ID/DNS
+exit
+EOF
+
+  echo "Lokinet daemon successfully started without it's intrusive DNS resolver."
+}
+
+down() {
+  set_lokinet_path "$1"
+  stop_lokinet "$LOKINET_PATH"
+}
+
+update() {
+  local INSTALL_SCRIPT_URL="https://raw.githubusercontent.com/entropi-hk/lokinetd-macos/main/install.sh"
+  echo "Updating lokinetd-macos..."
+  if command -v curl > /dev/null; then
+    curl -fsSL "$INSTALL_SCRIPT_URL" | bash
+  elif command -v wget > /dev/null; then
+    wget -qO- "$INSTALL_SCRIPT_URL" | bash
+  else
+    echo "Error: curl or wget is required to update lokinetd-macos." >&2
+    return 1
+  fi
+  echo "lokinetd-macos updated successfully."
+}
+
+version() {
+  echo $VERSION
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  if [[ $# -eq 0 ]]; then
+    echo "No arguments provided."
+    echo "Available functions: up, down, update, version"
+    exit 1
+  fi
+
+  case "$1" in
+    up | down | update | version)
+      "$1" "${@:2}"
+      ;;
+    *)
+      echo "Invalid command: $1"
+      echo "Available functions: up, down, update, version"
+      exit 1
+      ;;
+  esac
+fi
